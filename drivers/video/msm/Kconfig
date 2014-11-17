@@ -27,6 +27,13 @@ config FB_MSM_LOGO
 	---help---
 	  Show /initlogo.rle during boot.
 
+config FB_MSM_SEC_BOOTLOGO
+	depends on FB_MSM_LOGO
+	bool "MSM FB samsung booting logo"
+	default y
+	---help---
+	Show /I7500_xxx.rle and kernel progress bar image during boot.
+
 config FB_MSM_LCDC_HW
 	bool
 	default n
