@@ -340,8 +340,6 @@ msmsdcc_request_end(struct msmsdcc_host *host, struct mmc_request *mrq)
 
 	if (mrq->data)
 		mrq->data->bytes_xfered = host->curr.data_xfered;
-	if (mrq->cmd->error == -ETIMEDOUT)
-		mdelay(5);
 
 	/* Clear current request information as current request has ended */
 	memset(&host->curr, 0, sizeof(struct msmsdcc_curr_req));
@@ -766,7 +764,7 @@ static int msmsdcc_config_dma(struct msmsdcc_host *host, struct mmc_data *data)
 	struct msmsdcc_nc_dmadata *nc;
 	dmov_box *box;
 	uint32_t rows;
-	unsigned int n;
+	int n;
 	int i, err = 0, box_cmd_cnt = 0;
 	struct scatterlist *sg = data->sg;
 	unsigned int len, offset;
@@ -2765,7 +2763,7 @@ msmsdcc_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
 	else
 		clk |= MCI_CLK_WIDEBUS_1;
 
-	if (msmsdcc_is_pwrsave(host))
+	if (msmsdcc_is_pwrsave(host) && mmc_host_may_gate_card(host->mmc->card))
 		clk |= MCI_CLK_PWRSAVE;
 
 	clk |= MCI_CLK_FLOWENA;
@@ -3024,6 +3022,7 @@ static int msmsdcc_start_signal_voltage_switch(struct mmc_host *mmc,
 {
 	struct msmsdcc_host *host = mmc_priv(mmc);
 	unsigned long flags;
+	bool prev_pwrsave, curr_pwrsave;
 	int rc = 0;
 
 	spin_lock_irqsave(&host->lock, flags);
@@ -3040,11 +3039,15 @@ static int msmsdcc_start_signal_voltage_switch(struct mmc_host *mmc,
 		goto out;
 	}
 
-	spin_lock_irqsave(&host->lock, flags);
 	/*
 	 * If we are here means voltage switch from high voltage to
 	 * low voltage is required
 	 */
+
+	spin_lock_irqsave(&host->lock, flags);
+	prev_pwrsave = !!(readl_relaxed(host->base + MMCICLOCK) &
+			MCI_CLK_PWRSAVE);
+	curr_pwrsave = prev_pwrsave;
 
 	/*
 	 * Poll on MCIDATIN_3_0 and MCICMDIN bits of MCI_TEST_INPUT
@@ -3058,9 +3061,12 @@ static int msmsdcc_start_signal_voltage_switch(struct mmc_host *mmc,
 	}
 
 	/* Stop SD CLK output. */
-	writel_relaxed((readl_relaxed(host->base + MMCICLOCK) |
-			MCI_CLK_PWRSAVE), host->base + MMCICLOCK);
-	msmsdcc_sync_reg_wr(host);
+	if (!prev_pwrsave) {
+		writel_relaxed((readl_relaxed(host->base + MMCICLOCK) |
+				MCI_CLK_PWRSAVE), host->base + MMCICLOCK);
+		msmsdcc_sync_reg_wr(host);
+		curr_pwrsave = true;
+	}
 	spin_unlock_irqrestore(&host->lock, flags);
 
 	/*
@@ -3086,6 +3092,7 @@ static int msmsdcc_start_signal_voltage_switch(struct mmc_host *mmc,
 	writel_relaxed((readl_relaxed(host->base + MMCICLOCK)
 			& ~MCI_CLK_PWRSAVE), host->base + MMCICLOCK);
 	msmsdcc_sync_reg_wr(host);
+	curr_pwrsave = false;
 	spin_unlock_irqrestore(&host->lock, flags);
 
 	/*
@@ -3106,10 +3113,9 @@ static int msmsdcc_start_signal_voltage_switch(struct mmc_host *mmc,
 	}
 
 out_unlock:
-	/* Enable PWRSAVE */
-	writel_relaxed((readl_relaxed(host->base + MMCICLOCK) |
-			MCI_CLK_PWRSAVE), host->base + MMCICLOCK);
-	msmsdcc_sync_reg_wr(host);
+	/* Restore the correct PWRSAVE state */
+	if (prev_pwrsave ^ curr_pwrsave)
+		msmsdcc_set_pwrsave(mmc, prev_pwrsave);
 	spin_unlock_irqrestore(&host->lock, flags);
 out:
 	return rc;
@@ -3148,17 +3154,24 @@ static int msmsdcc_init_cm_sdc4_dll(struct msmsdcc_host *host)
 	int rc = 0;
 	unsigned long flags;
 	u32 wait_cnt;
+	bool prev_pwrsave, curr_pwrsave;
 
 	spin_lock_irqsave(&host->lock, flags);
+	prev_pwrsave = !!(readl_relaxed(host->base + MMCICLOCK) &
+			MCI_CLK_PWRSAVE);
+	curr_pwrsave = prev_pwrsave;
 	/*
 	 * Make sure that clock is always enabled when DLL
 	 * tuning is in progress. Keeping PWRSAVE ON may
 	 * turn off the clock. So let's disable the PWRSAVE
 	 * here and re-enable it once tuning is completed.
 	 */
-	writel_relaxed((readl_relaxed(host->base + MMCICLOCK)
-			& ~MCI_CLK_PWRSAVE), host->base + MMCICLOCK);
-	msmsdcc_sync_reg_wr(host);
+	if (prev_pwrsave) {
+		writel_relaxed((readl_relaxed(host->base + MMCICLOCK)
+				& ~MCI_CLK_PWRSAVE), host->base + MMCICLOCK);
+		msmsdcc_sync_reg_wr(host);
+		curr_pwrsave = false;
+	}
 
 	/* Write 1 to DLL_RST bit of MCI_DLL_CONFIG register */
 	writel_relaxed((readl_relaxed(host->base + MCI_DLL_CONFIG)
@@ -3201,10 +3214,9 @@ static int msmsdcc_init_cm_sdc4_dll(struct msmsdcc_host *host)
 	}
 
 out:
-	/* re-enable PWRSAVE */
-	writel_relaxed((readl_relaxed(host->base + MMCICLOCK) |
-			MCI_CLK_PWRSAVE), host->base + MMCICLOCK);
-	msmsdcc_sync_reg_wr(host);
+	/* Restore the correct PWRSAVE state */
+	if (prev_pwrsave ^ curr_pwrsave)
+		msmsdcc_set_pwrsave(host->mmc, prev_pwrsave);
 	spin_unlock_irqrestore(&host->lock, flags);
 
 	return rc;
