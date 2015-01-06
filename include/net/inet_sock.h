@@ -89,11 +89,21 @@ struct inet_request_sock {
 				no_srccheck: 1;
 	kmemcheck_bitfield_end(flags);
 	struct ip_options_rcu	*opt;
+	u32                     ir_mark;
 };
 
 static inline struct inet_request_sock *inet_rsk(const struct request_sock *sk)
 {
 	return (struct inet_request_sock *)sk;
+}
+
+static inline u32 inet_request_mark(struct sock *sk, struct sk_buff *skb)
+{
+	if (!sk->sk_mark && sock_net(sk)->ipv4.sysctl_tcp_fwmark_accept) {
+		return skb->mark;
+	} else {
+		return sk->sk_mark;
+	}
 }
 
 struct inet_cork {
@@ -240,7 +250,7 @@ static inline __u8 inet_sk_flowi_flags(const struct sock *sk)
 {
 	__u8 flags = 0;
 
-	if (inet_sk(sk)->transparent)
+	if (inet_sk(sk)->transparent || inet_sk(sk)->hdrincl)
 		flags |= FLOWI_FLAG_ANYSRC;
 	if (sk->sk_protocol == IPPROTO_TCP)
 		flags |= FLOWI_FLAG_PRECOW_METRICS;
